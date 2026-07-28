@@ -8,7 +8,35 @@
 - macOS 优先支持；密码/密钥存系统钥匙串，不落盘
 - 三种用法：子命令、交互式 REPL、Web 图形界面
 
+## 效果预览
+
+| CLI                 | Web 概览              |
+| ------------------- | --------------------- |
+| ![CLI](img/cli.png) | ![概览](img/home.png) |
+
+| 主机管理               | 文件上传                |
+| ---------------------- | ----------------------- |
+| ![主机](img/hosts.png) | ![上传](img/upload.png) |
+
+| 上传日志              | 远程终端                  |
+| --------------------- | ------------------------- |
+| ![日志](img/logs.png) | ![终端](img/terminal.png) |
+
 ## 安装与构建
+
+### 方式一：从 Release 下载（推荐）
+
+前往 [Releases](https://github.com/yn-zxj/sup/releases) 下载对应平台的产物，解压后直接使用：
+
+```bash
+tar -xzf sup-*.tar.gz
+sudo mv sup /usr/local/bin/
+sup --help
+```
+
+> macOS 首次运行若提示无法验证开发者，执行 `xattr -d com.apple.quarantine /usr/local/bin/sup` 后重试。
+
+### 方式二：本地构建
 
 依赖：Rust（stable）、Node.js ≥ 20（仅构建 Web 前端用）。
 
@@ -62,14 +90,14 @@ sup push <host> --map dist:/var/www/app/dist   # 目录会递归上传
 sup push <host> --from-file files.txt          # 从清单文件批量读取
 ```
 
-| 选项 | 说明 |
-|---|---|
-| `--map 本地:远程` | 路径映射，可重复；只写本地路径时按 `remote_root` 拼接 |
-| `--from-file <file>` | 清单文件，每行一条映射，`#` 开头为注释 |
-| `--remote-root <dir>` | 覆盖主机配置的远程根目录 |
-| `-y, --yes` | 缺失文件自动剔除，不询问 |
-| `--concurrency <n>` | 并发连接数（默认 4） |
-| `--retry <n>` | 单文件失败重试次数（默认 2） |
+| 选项                  | 说明                                                  |
+| --------------------- | ----------------------------------------------------- |
+| `--map 本地:远程`     | 路径映射，可重复；只写本地路径时按 `remote_root` 拼接 |
+| `--from-file <file>`  | 清单文件，每行一条映射，`#` 开头为注释                |
+| `--remote-root <dir>` | 覆盖主机配置的远程根目录                              |
+| `-y, --yes`           | 缺失文件自动剔除，不询问                              |
+| `--concurrency <n>`   | 并发连接数（默认 4）                                  |
+| `--retry <n>`         | 单文件失败重试次数（默认 2）                          |
 
 上传流程：校验本地文件存在性 → 缺失的标红列出并询问是否剔除 → 并发上传（自动创建远程目录，实时进度条）→ 汇总并写入日志。
 
@@ -96,18 +124,18 @@ sup(prod)> /push        # 交互式上传向导
 sup(prod)> systemctl restart app    # 非 / 开头的输入直接作为远程命令执行
 ```
 
-| 命令 | 说明 |
-|---|---|
-| `/help` | 帮助 |
-| `/hosts` | 列出主机 |
-| `/use <name>` | 连接主机 |
-| `/push` | 上传向导（逐行输入映射，空行结束） |
-| `/ssh` | 进入完整 PTY 终端 |
-| `/log` | 查看上传日志 |
-| `/config` | 显示配置文件位置 |
-| `/ui` | 启动 Web 界面 |
-| `/clear` | 清屏 |
-| `/quit` `/exit` | 退出 |
+| 命令            | 说明                               |
+| --------------- | ---------------------------------- |
+| `/help`         | 帮助                               |
+| `/hosts`        | 列出主机                           |
+| `/use <name>`   | 连接主机                           |
+| `/push`         | 上传向导（逐行输入映射，空行结束） |
+| `/ssh`          | 进入完整 PTY 终端                  |
+| `/log`          | 查看上传日志                       |
+| `/config`       | 显示配置文件位置                   |
+| `/ui`           | 启动 Web 界面                      |
+| `/clear`        | 清屏                               |
+| `/quit` `/exit` | 退出                               |
 
 ## Web 界面
 
@@ -129,14 +157,31 @@ shadcn/ui 风格的图形界面（仅监听本机回环地址），包含五个�
 
 ## 配置与数据
 
-| 路径 | 内容 |
-|---|---|
-| `~/.config/sup/hosts.toml` | 主机配置（不含密码） |
-| `~/.config/sup/presets.toml` | 上传预设 |
-| `~/.config/sup/sup.db` | 上传日志（SQLite） |
-| 系统钥匙串（服务名 `sup-cli`） | 密码 / 私钥口令 |
+| 路径                           | 内容                 |
+| ------------------------------ | -------------------- |
+| `~/.config/sup/hosts.toml`     | 主机配置（不含密码） |
+| `~/.config/sup/presets.toml`   | 上传预设             |
+| `~/.config/sup/sup.db`         | 上传日志（SQLite）   |
+| 系统钥匙串（服务名 `sup-cli`） | 密码 / 私钥口令      |
 
 ## 发布
+
+推送 `v*` 标签即触发 GitHub Actions 流水线（`.github/workflows/release.yml`），自动完成前端编译 → Rust 交叉构建 → 产物上传到 Release，无需本地编译：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+流水线产物覆盖三个平台：
+
+| 产物                                  | 平台                  |
+| ------------------------------------- | --------------------- |
+| `sup-aarch64-apple-darwin.tar.gz`     | macOS (Apple Silicon) |
+| `sup-x86_64-apple-darwin.tar.gz`      | macOS (Intel)         |
+| `sup-x86_64-unknown-linux-gnu.tar.gz` | Linux (x86_64)        |
+
+本地构建发布版：
 
 ```bash
 cd web && npm run build && cd ..
