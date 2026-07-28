@@ -20,7 +20,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 rust-embed = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ssh2 = "0.9"
+ssh2 = { version = "0.9", features = ["vendored-openssl"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 toml = "0.8"
 walkdir = "2"
