@@ -1,0 +1,32 @@
+[package]
+name = "sup"
+version = "0.1.0"
+edition = "2021"
+description = "轻量级远程部署与主机管理工具"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.7", features = ["ws"] }
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.27"
+dirs = "5"
+indicatif = "0.17"
+keyring = "2"
+mime_guess = "2"
+open = "5"
+rpassword = "7"
+rusqlite = { version = "0.31", features = ["bundled"] }
+rust-embed = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ssh2 = "0.9"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+toml = "0.8"
+walkdir = "2"
+
+[profile.release]
+lto = true
+strip = true
+opt-level = "z"
+codegen-units = 1
