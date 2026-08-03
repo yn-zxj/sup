@@ -124,6 +124,7 @@ export async function* runAgentStream(
   content?: string
   toolName?: string
   toolOutput?: string
+  toolCallId?: string
 }> {
   const agent = createAgent()
 
@@ -146,26 +147,32 @@ export async function* runAgentStream(
 
         for (const msg of output.messages) {
           if (msg instanceof AIMessage) {
-            // AI 的文本回复
-            const content = typeof msg.content === 'string' 
-              ? msg.content 
-              : JSON.stringify(msg.content)
-            
-            if (content.length > 0) {
-              yield { type: 'text', content }
-            }
-
-            // 工具调用
+            // 工具调用（先发，确保前端展示顺序：工具 → 文本 → 审批 → 总结）
             if (msg.tool_calls && msg.tool_calls.length > 0) {
               for (const tc of msg.tool_calls) {
-                yield { type: 'tool_start', toolName: tc.name, content: JSON.stringify(tc.args) }
+                yield {
+                  type: 'tool_start',
+                  toolName: tc.name,
+                  content: JSON.stringify(tc.args),
+                  toolCallId: tc.id,
+                }
               }
+            }
+
+            // AI 的文本回复
+            const content = typeof msg.content === 'string'
+              ? msg.content
+              : JSON.stringify(msg.content)
+
+            if (content.length > 0) {
+              yield { type: 'text', content }
             }
           } else if (msg instanceof ToolMessage) {
             yield {
               type: 'tool_end',
               toolName: msg.name,
               toolOutput: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content),
+              toolCallId: msg.tool_call_id,
             }
           }
         }

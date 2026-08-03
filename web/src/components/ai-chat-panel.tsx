@@ -9,9 +9,11 @@ import {
   User,
   Wrench,
   ShieldAlert,
+  ShieldCheck,
   Clock,
   Check,
   X,
+  Copy,
   ChevronDown,
   ChevronUp,
   Settings,
@@ -27,11 +29,15 @@ interface ChatMessage {
   toolName?: string
   toolArgs?: string
   toolOutput?: string
+  toolStatus?: 'running' | 'done' | 'failed'
+  toolCallId?: string
   approvalId?: string
   command?: string
   risk?: string
   timestamp: number
+  createdAt?: number
   expanded?: boolean
+  resolved?: 'approved' | 'rejected'
 }
 
 interface AiChatPanelProps {
@@ -40,12 +46,21 @@ interface AiChatPanelProps {
   onCommandReject?: (approvalId: string) => void
 }
 
-/** Markdown 渲染组件（带错误兜底） */
+/** Markdown 渲染组件（带错误兜底，表格支持横向滚动） */
 function MarkdownContent({ content }: { content: string }) {
   try {
     return (
       <div className="prose prose-sm dark:prose-invert max-w-none prose-headings:text-foreground prose-p:text-sm prose-p:leading-relaxed prose-code:text-xs prose-code:bg-muted-foreground/10 prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-pre:bg-zinc-950 prose-pre:text-zinc-100 prose-pre:text-xs prose-pre:rounded-lg prose-a:text-primary prose-strong:text-foreground prose-li:text-sm prose-table:text-xs">
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm]}
+          components={{
+            table: ({ children }) => (
+              <div className="overflow-x-auto">
+                <table>{children}</table>
+              </div>
+            ),
+          }}
+        >
           {content}
         </ReactMarkdown>
       </div>
@@ -62,11 +77,35 @@ export function AiChatPanel({ host, onCommandApprove, onCommandReject }: AiChatP
   const [loading, setLoading] = useState(false)
   const [streaming, setStreaming] = useState('')
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [copiedId, setCopiedId] = useState<string | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
+  // 跟踪本轮对话是否已经历过工具调用，用于将最终总结放到工具消息后面
+  const hasToolsRef = useRef(false)
+  const postToolAssistantId = useRef<string | null>(null)
+  // 跟踪当前正在执行的工具消息，用于 tool_end 时兜底更新
+  const lastToolMsgId = useRef<string | null>(null)
+  // 审批倒计时 ticker
+  const [now, setNow] = useState(Date.now())
+  // 用户主动交互（展开/收起/审批）时不自动滚动到底部
+  const skipScrollRef = useRef(false)
 
   useEffect(() => {
+    if (skipScrollRef.current) {
+      skipScrollRef.current = false
+      return
+    }
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
   }, [messages, streaming])
+
+  // 审批倒计时：有未处理的审批时每秒刷新
+  useEffect(() => {
+    const hasActiveApprovals = messages.some(
+      (m) => m.role === 'approval' && m.createdAt && !m.resolved
+    )
+    if (!hasActiveApprovals) return
+    const timer = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(timer)
+  }, [messages])
 
   const addMessage = useCallback((msg: Omit<ChatMessage, 'id' | 'timestamp'>) => {
     const id = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
@@ -83,6 +122,21 @@ export function AiChatPanel({ host, onCommandApprove, onCommandReject }: AiChatP
       }
       return prev
     })
+  }, [])
+
+  const copyText = useCallback(async (id: string, text: string) => {
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopiedId(id)
+      setTimeout(() => setCopiedId((cur) => (cur === id ? null : cur)), 1500)
+    } catch {
+      /* ignore */
+    }
+  }, [])
+
+  const toggleToolExpand = useCallback((id: string) => {
+    skipScrollRef.current = true
+    setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, expanded: !m.expanded } : m)))
   }, [])
 
   const sendMessage = async () => {
@@ -112,6 +166,11 @@ export function AiChatPanel({ host, onCommandApprove, onCommandReject }: AiChatP
       let buffer = ''
       let currentAssistant = ''
 
+      // 重置工具跟踪状态
+      hasToolsRef.current = false
+      postToolAssistantId.current = null
+      lastToolMsgId.current = null
+
       addMessage({ role: 'assistant', content: '' })
 
       while (true) {
@@ -131,24 +190,83 @@ export function AiChatPanel({ host, onCommandApprove, onCommandReject }: AiChatP
             const event = JSON.parse(data)
             switch (event.type) {
               case 'text':
-                currentAssistant += event.content
-                updateLastAssistant(currentAssistant)
+                if (hasToolsRef.current) {
+                  // 工具调用后的总结文本：创建/更新一个新的 assistant 气泡在工具消息后面
+                  if (postToolAssistantId.current) {
+                    setMessages((prev) =>
+                      prev.map((m) =>
+                        m.id === postToolAssistantId.current
+                          ? { ...m, content: m.content + event.content }
+                          : m
+                      )
+                    )
+                  } else {
+                    const id = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+                    postToolAssistantId.current = id
+                    setMessages((prev) => [
+                      ...prev,
+                      { role: 'assistant', content: event.content, id, timestamp: Date.now() },
+                    ])
+                  }
+                } else {
+                  // 工具调用前的文本：累积到当前 assistant 气泡
+                  currentAssistant += event.content
+                  updateLastAssistant(currentAssistant)
+                }
                 setStreaming(event.content)
                 break
               case 'tool_start':
-                addMessage({
-                  role: 'tool',
-                  content: `调用工具: ${event.toolName}`,
-                  toolName: event.toolName,
-                  toolArgs: event.content,
-                })
+                hasToolsRef.current = true
+                {
+                  const id = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+                  lastToolMsgId.current = id
+                  setMessages((prev) => [
+                    ...prev,
+                    {
+                      role: 'tool' as const,
+                      content: `调用工具: ${event.toolName}`,
+                      toolName: event.toolName,
+                      toolArgs: event.content,
+                      toolCallId: event.toolCallId,
+                      toolStatus: 'running' as const,
+                      id,
+                      timestamp: Date.now(),
+                    },
+                  ])
+                }
                 break
               case 'tool_end':
-                addMessage({
-                  role: 'tool',
-                  content: event.toolOutput?.slice(0, 200) || '',
-                  toolName: event.toolName,
-                  toolOutput: event.toolOutput,
+                setMessages((prev) => {
+                  // 优先按 toolCallId 精确匹配（支持多工具并行执行）
+                  if (event.toolCallId) {
+                    const target = prev.find((m) => m.toolCallId === event.toolCallId)
+                    if (target) {
+                      return prev.map((m) =>
+                        m.id === target.id
+                          ? {
+                              ...m,
+                              toolOutput: event.toolOutput,
+                              toolStatus: 'done' as const,
+                              content: event.toolOutput?.slice(0, 200) || '',
+                            }
+                          : m
+                      )
+                    }
+                  }
+                  // 兜底：按最近一次 tool_start 匹配
+                  if (lastToolMsgId.current) {
+                    return prev.map((m) =>
+                      m.id === lastToolMsgId.current
+                        ? {
+                            ...m,
+                            toolOutput: event.toolOutput,
+                            toolStatus: 'done' as const,
+                            content: event.toolOutput?.slice(0, 200) || '',
+                          }
+                        : m
+                    )
+                  }
+                  return prev
                 })
                 break
               case 'error':
@@ -191,6 +309,7 @@ export function AiChatPanel({ host, onCommandApprove, onCommandReject }: AiChatP
               command: a.command,
               risk: a.risk,
               timestamp: Date.now(),
+              createdAt: Date.now(),
             },
           ]
         })
@@ -202,9 +321,10 @@ export function AiChatPanel({ host, onCommandApprove, onCommandReject }: AiChatP
     es.addEventListener('approved', (e) => {
       try {
         const { id } = JSON.parse(e.data)
+        skipScrollRef.current = true
         setMessages((prev) =>
           prev.map((m) =>
-            m.approvalId === id ? { ...m, role: 'system' as const, content: `已批准: ${m.command}` } : m
+            m.approvalId === id ? { ...m, resolved: 'approved' as const } : m
           )
         )
       } catch {
@@ -215,11 +335,23 @@ export function AiChatPanel({ host, onCommandApprove, onCommandReject }: AiChatP
     es.addEventListener('rejected', (e) => {
       try {
         const { id } = JSON.parse(e.data)
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.approvalId === id ? { ...m, role: 'system' as const, content: `已拒绝: ${m.command}` } : m
+        skipScrollRef.current = true
+        setMessages((prev) => {
+          // 审批卡片标记为已拒绝
+          let updated = prev.map((m) =>
+            m.approvalId === id ? { ...m, resolved: 'rejected' as const } : m
           )
-        )
+          // 兜底：如果对应工具仍处于"执行中"（tool_end 未到达），标记为失败
+          for (let i = updated.length - 1; i >= 0; i--) {
+            if (updated[i].role === 'tool' && updated[i].toolStatus === 'running') {
+              updated = updated.map((m, idx) =>
+                idx === i ? { ...m, toolStatus: 'failed' as const } : m
+              )
+              break
+            }
+          }
+          return updated
+        })
       } catch {
         /* ignore */
       }
@@ -272,11 +404,11 @@ export function AiChatPanel({ host, onCommandApprove, onCommandReject }: AiChatP
 
       case 'assistant':
         return (
-          <div key={msg.id} className="flex items-start gap-2">
+          <div key={msg.id} className="flex items-start gap-2 group">
             <div className="bg-muted rounded-full p-1 shrink-0">
               <Bot className="size-3.5" />
             </div>
-            <div className="bg-muted rounded-lg px-3 py-2 text-sm max-w-[85%]">
+            <div className="bg-muted rounded-lg px-3 py-2 text-sm max-w-[85%] min-w-0">
               {msg.content ? (
                 <MarkdownContent content={msg.content} />
               ) : (
@@ -285,79 +417,229 @@ export function AiChatPanel({ host, onCommandApprove, onCommandReject }: AiChatP
                   思考中...
                 </span>
               )}
-            </div>
-          </div>
-        )
-
-      case 'tool':
-        return (
-          <div key={msg.id} className="flex items-start gap-2">
-            <div className="bg-amber-100 dark:bg-amber-900/30 rounded-full p-1 shrink-0">
-              <Wrench className="size-3.5 text-amber-600" />
-            </div>
-            <div className="bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800 rounded-lg px-3 py-1.5 text-xs max-w-[85%]">
-              <button
-                className="flex items-center gap-1 font-medium text-amber-700 dark:text-amber-400 w-full text-left"
-                onClick={() =>
-                  setMessages((prev) =>
-                    prev.map((m) => (m.id === msg.id ? { ...m, expanded: !m.expanded } : m))
-                  )
-                }
-              >
-                {msg.expanded ? <ChevronUp className="size-3" /> : <ChevronDown className="size-3" />}
-                工具: {msg.toolName}
-              </button>
-              {msg.expanded && (
-                <pre className="mt-1 text-[10px] text-muted-foreground whitespace-pre-wrap overflow-x-auto max-h-24">
-                  {msg.toolOutput || msg.toolArgs || ''}
-                </pre>
+              {msg.content && (
+                <div className="flex justify-end">
+                  <button
+                    className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded hover:bg-muted-foreground/10 text-muted-foreground"
+                    onClick={() => copyText(msg.id, msg.content)}
+                    title="复制内容"
+                  >
+                    {copiedId === msg.id ? (
+                      <Check className="size-3 text-green-600" />
+                    ) : (
+                      <Copy className="size-3" />
+                    )}
+                  </button>
+                </div>
               )}
             </div>
           </div>
         )
 
-      case 'approval':
+      case 'tool': {
+        const isRunning = msg.toolStatus === 'running'
+        const isFailed = msg.toolStatus === 'failed'
+        const iconBg = isRunning
+          ? 'bg-blue-100 dark:bg-blue-900/30'
+          : isFailed
+            ? 'bg-red-100 dark:bg-red-900/30'
+            : 'bg-amber-100 dark:bg-amber-900/30'
+        const cardStyle = isRunning
+          ? 'bg-blue-50 dark:bg-blue-950/20 border-blue-200 dark:border-blue-800'
+          : isFailed
+            ? 'bg-red-50 dark:bg-red-950/20 border-red-200 dark:border-red-800'
+            : 'bg-amber-50 dark:bg-amber-950/20 border-amber-200 dark:border-amber-800'
+        const textColor = isRunning
+          ? 'text-blue-700 dark:text-blue-400'
+          : isFailed
+            ? 'text-red-700 dark:text-red-400'
+            : 'text-amber-700 dark:text-amber-400'
         return (
           <div key={msg.id} className="flex items-start gap-2">
-            <div className="bg-red-100 dark:bg-red-900/30 rounded-full p-1 shrink-0">
-              <ShieldAlert className="size-3.5 text-red-600" />
+            <div className={`${iconBg} rounded-full p-1 shrink-0`}>
+              {isRunning ? (
+                <Loader2 className="size-3.5 text-blue-600 animate-spin" />
+              ) : isFailed ? (
+                <X className="size-3.5 text-red-600" />
+              ) : (
+                <Check className="size-3.5 text-green-600" />
+              )}
             </div>
-            <div className="bg-red-50 dark:bg-red-950/20 border border-red-200 dark:border-red-800 rounded-lg px-3 py-2 text-xs max-w-[85%] w-full">
-              <div className="flex items-center gap-1.5 font-medium text-red-700 dark:text-red-400 mb-1.5">
-                <ShieldAlert className="size-3.5" />
-                危险操作需要审批
+            <div className={`${cardStyle} border rounded-lg px-3 py-1.5 text-xs max-w-[85%] min-w-0`}>
+              <button
+                className={`flex items-center gap-1.5 font-medium w-full text-left ${textColor}`}
+                onClick={() => toggleToolExpand(msg.id)}
+              >
+                {msg.expanded ? <ChevronUp className="size-3" /> : <ChevronDown className="size-3" />}
+                <Wrench className="size-3" />
+                <span>{msg.toolName}</span>
+                {isRunning && (
+                  <span className="text-[10px] opacity-70 ml-1">执行中...</span>
+                )}
+                {isFailed && (
+                  <span className="text-[10px] opacity-70 ml-1">已拒绝/失败</span>
+                )}
+              </button>
+              {msg.expanded && (
+                <div className="mt-1.5 space-y-1.5">
+                  {/* 入参 */}
+                  <div>
+                    <div className="text-[10px] font-medium text-muted-foreground mb-0.5">
+                      📥 入参
+                    </div>
+                    <pre className="text-[10px] text-muted-foreground whitespace-pre-wrap overflow-x-auto max-h-20 bg-black/5 dark:bg-white/5 rounded p-1.5">
+                      {msg.toolArgs || '(无)'}
+                    </pre>
+                  </div>
+                  {/* 输出 */}
+                  {msg.toolOutput != null && (
+                    <div>
+                      <div className="text-[10px] font-medium text-muted-foreground mb-0.5">
+                        📤 输出
+                      </div>
+                      <pre className="text-[10px] text-muted-foreground whitespace-pre-wrap overflow-x-auto max-h-24 bg-black/5 dark:bg-white/5 rounded p-1.5">
+                        {msg.toolOutput || '(空)'}
+                      </pre>
+                    </div>
+                  )}
+                  {isRunning && (
+                    <div className="flex items-center gap-1 text-[10px] text-blue-600 dark:text-blue-400">
+                      <Loader2 className="size-2.5 animate-spin" />
+                      等待执行结果...
+                    </div>
+                  )}
+                  {isFailed && (
+                    <div className="flex items-center gap-1 text-[10px] text-red-600 dark:text-red-400">
+                      <X className="size-2.5" />
+                      命令未执行（审批被拒绝或执行失败）
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        )
+      }
+
+      case 'approval': {
+        const isResolved = msg.resolved != null
+        const isApproved = msg.resolved === 'approved'
+        const isRejected = msg.resolved === 'rejected'
+        const elapsed = msg.createdAt && !isResolved
+          ? Math.floor((now - msg.createdAt) / 1000)
+          : 0
+        const remaining = !isResolved ? Math.max(0, 30 - elapsed) : 0
+        const isUrgent = remaining <= 10 && remaining > 0
+
+        // 根据状态选择颜色
+        const colorSet = isApproved
+          ? {
+              iconBg: 'bg-green-100 dark:bg-green-900/30',
+              iconColor: 'text-green-600',
+              cardBg: 'bg-green-50 dark:bg-green-950/20',
+              cardBorder: 'border-green-200 dark:border-green-800',
+              titleColor: 'text-green-700 dark:text-green-400',
+              codeBg: 'bg-green-100 dark:bg-green-900/40',
+            }
+          : isRejected
+            ? {
+                iconBg: 'bg-gray-100 dark:bg-gray-800/50',
+                iconColor: 'text-gray-500',
+                cardBg: 'bg-gray-50 dark:bg-gray-900/30',
+                cardBorder: 'border-gray-200 dark:border-gray-700',
+                titleColor: 'text-gray-600 dark:text-gray-400',
+                codeBg: 'bg-gray-100 dark:bg-gray-800/40',
+              }
+            : {
+                iconBg: 'bg-red-100 dark:bg-red-900/30',
+                iconColor: 'text-red-600',
+                cardBg: 'bg-red-50 dark:bg-red-950/20',
+                cardBorder: 'border-red-200 dark:border-red-800',
+                titleColor: 'text-red-700 dark:text-red-400',
+                codeBg: 'bg-red-100 dark:bg-red-900/40',
+              }
+
+        return (
+          <div key={msg.id} className="flex items-start gap-2">
+            <div className={`${colorSet.iconBg} rounded-full p-1 shrink-0`}>
+              {isApproved ? (
+                <ShieldCheck className={`size-3.5 ${colorSet.iconColor}`} />
+              ) : (
+                <ShieldAlert className={`size-3.5 ${colorSet.iconColor}`} />
+              )}
+            </div>
+            <div className={`${colorSet.cardBg} ${colorSet.cardBorder} border rounded-lg px-3 py-2 text-xs max-w-[85%] w-full`}>
+              <div className={`flex items-center gap-1.5 font-medium ${colorSet.titleColor} mb-1.5`}>
+                {isApproved ? (
+                  <ShieldCheck className="size-3.5" />
+                ) : (
+                  <ShieldAlert className="size-3.5" />
+                )}
+                {isResolved
+                  ? isApproved
+                    ? '已批准执行'
+                    : '已拒绝执行'
+                  : '危险操作需要审批'}
               </div>
-              <code className="block bg-red-100 dark:bg-red-900/40 rounded px-2 py-1 text-[11px] mb-2 font-mono break-all whitespace-pre-wrap">
+              <code className={`block ${colorSet.codeBg} rounded px-2 py-1 text-[11px] mb-2 font-mono break-all whitespace-pre-wrap`}>
                 {msg.command}
               </code>
               <div className="flex items-center gap-1.5">
-                <Badge variant="outline" className="text-red-600 text-[10px]">
+                <Badge variant="outline" className={`text-[10px] ${isApproved ? 'text-green-600' : isRejected ? 'text-gray-500' : 'text-red-600'}`}>
                   {msg.risk === 'dangerous' ? '不可逆操作' : '需确认'}
                 </Badge>
-                <span className="text-[10px] text-muted-foreground flex items-center gap-0.5">
-                  <Clock className="size-2.5" /> 30s 超时自动拒绝
-                </span>
+                {isResolved ? (
+                  <span className={`text-[10px] font-medium ${isApproved ? 'text-green-600' : 'text-gray-500'}`}>
+                    {isApproved ? '已批准' : '已拒绝'}
+                  </span>
+                ) : (
+                  <span
+                    className={`text-[10px] flex items-center gap-0.5 font-mono ${
+                      isUrgent ? 'text-red-600 font-medium' : 'text-muted-foreground'
+                    }`}
+                  >
+                    <Clock className={`size-2.5 ${isUrgent ? 'animate-pulse' : ''}`} />
+                    {remaining > 0 ? `${remaining}s 后自动拒绝` : '已超时'}
+                  </span>
+                )}
                 <div className="ml-auto flex gap-1">
                   <Button
                     size="sm"
-                    variant="outline"
-                    className="h-6 text-[10px] text-red-600 hover:bg-red-50"
-                    onClick={() => msg.approvalId && handleReject(msg.approvalId)}
+                    variant={isRejected ? 'default' : 'outline'}
+                    className={`h-6 text-[10px] ${
+                      isRejected
+                        ? 'bg-red-600 hover:bg-red-600 cursor-default'
+                        : isResolved
+                          ? 'text-muted-foreground border-muted cursor-default'
+                          : 'text-red-600 hover:bg-red-50'
+                    }`}
+                    onClick={() => !isResolved && msg.approvalId && handleReject(msg.approvalId)}
+                    disabled={isResolved}
                   >
-                    <X className="size-3" /> 拒绝
+                    <X className="size-3" />
+                    {isRejected ? '已拒绝' : '拒绝'}
                   </Button>
                   <Button
                     size="sm"
-                    className="h-6 text-[10px] bg-green-600 hover:bg-green-700"
-                    onClick={() => msg.approvalId && handleApprove(msg.approvalId)}
+                    className={`h-6 text-[10px] ${
+                      isApproved
+                        ? 'bg-green-600 hover:bg-green-600 cursor-default'
+                        : isResolved
+                          ? 'bg-muted text-muted-foreground cursor-default'
+                          : 'bg-green-600 hover:bg-green-700'
+                    }`}
+                    onClick={() => !isResolved && msg.approvalId && handleApprove(msg.approvalId)}
+                    disabled={isResolved}
                   >
-                    <Check className="size-3" /> 批准
+                    <Check className="size-3" />
+                    {isApproved ? '已批准' : '批准'}
                   </Button>
                 </div>
               </div>
             </div>
           </div>
         )
+      }
 
       case 'system':
         return (
