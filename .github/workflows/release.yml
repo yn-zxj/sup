@@ -38,6 +38,13 @@ jobs:
           npm ci
           npm run build
 
+      # AI 服务 bundle 也会嵌入二进制
+      - name: Build AI bundle
+        working-directory: ai
+        run: |
+          npm ci
+          npm run bundle
+
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |

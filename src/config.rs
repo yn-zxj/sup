@@ -104,3 +104,72 @@ pub fn delete_secret(name: &str) {
         let _ = e.delete_password();
     }
 }
+
+// ---------- AI config ----------
+
+const AI_KEYRING_KEY: &str = "ai-api-key";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiConfig {
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_provider")]
+    pub provider: String,
+    #[serde(default = "default_base_url")]
+    pub base_url: String,
+    #[serde(default = "default_model")]
+    pub model: String,
+    #[serde(default = "default_ai_port")]
+    pub port: u16,
+}
+
+fn default_enabled() -> bool { true }
+fn default_provider() -> String { "openai".into() }
+fn default_base_url() -> String { "https://api.openai.com/v1".into() }
+fn default_model() -> String { "gpt-4o".into() }
+fn default_ai_port() -> u16 { 7799 }
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            provider: "openai".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            model: "gpt-4o".into(),
+            port: 7799,
+        }
+    }
+}
+
+pub fn ai_config_path() -> Result<PathBuf> {
+    Ok(config_dir()?.join("ai.toml"))
+}
+
+pub fn load_ai_config() -> Result<AiConfig> {
+    let p = ai_config_path()?;
+    if !p.exists() {
+        return Ok(AiConfig::default());
+    }
+    let s = fs::read_to_string(&p)?;
+    toml::from_str(&s).context("ai.toml 解析失败")
+}
+
+pub fn save_ai_config(cfg: &AiConfig) -> Result<()> {
+    fs::write(ai_config_path()?, toml::to_string_pretty(cfg)?)?;
+    Ok(())
+}
+
+/// 获取 AI API Key（从系统钥匙串）
+pub fn get_ai_api_key() -> Option<String> {
+    get_secret(AI_KEYRING_KEY)
+}
+
+/// 保存 AI API Key 到系统钥匙串
+pub fn set_ai_api_key(key: &str) -> Result<()> {
+    set_secret(AI_KEYRING_KEY, key)
+}
+
+/// 删除 AI API Key
+pub fn delete_ai_api_key() {
+    delete_secret(AI_KEYRING_KEY);
+}

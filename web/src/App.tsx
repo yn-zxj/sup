@@ -21,6 +21,7 @@ import { HostsPage } from '@/components/hosts-page'
 import { UploadPage } from '@/components/upload-page'
 import { LogsPage } from '@/components/logs-page'
 import { TerminalPage } from '@/components/terminal-page'
+import { FileEditorPage } from '@/components/file-editor-page'
 import {
   LayoutDashboard,
   Server,
@@ -28,6 +29,7 @@ import {
   ScrollText,
   SquareTerminal,
   Rocket,
+  FileCode,
 } from 'lucide-react'
 
 const NAV = [
@@ -36,6 +38,7 @@ const NAV = [
   { id: 'upload', label: '上传', icon: Upload },
   { id: 'logs', label: '日志', icon: ScrollText },
   { id: 'terminal', label: '终端', icon: SquareTerminal },
+  { id: 'files', label: '文件编辑', icon: FileCode },
 ]
 
 export default function App() {
@@ -102,6 +105,7 @@ export default function App() {
           {page === 'upload' && <UploadPage hosts={hosts} />}
           {page === 'logs' && <LogsPage hosts={hosts} />}
           {page === 'terminal' && <TerminalPage hosts={hosts} />}
+          {page === 'files' && <FileEditorPage hosts={hosts} />}
         </main>
       </SidebarInset>
       <Toaster richColors position="top-right" />

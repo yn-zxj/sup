@@ -8,6 +8,15 @@ export interface HostItem {
   note?: string | null
 }
 
+export interface HostImportItem {
+  name: string
+  host: string
+  port: number
+  user: string
+  remote_root?: string | null
+  note?: string | null
+}
+
 export interface SaveHostReq {
   name: string
   host: string
@@ -72,6 +81,22 @@ export interface RunStatus {
   error?: string | null
 }
 
+export interface FileEntry {
+  name: string
+  path: string
+  size: number
+  is_dir: boolean
+  mode: number
+  modified: number
+}
+
+export interface FileStat {
+  size: number
+  is_dir: boolean
+  mode: number
+  modified: number
+}
+
 async function req<T>(url: string, init?: RequestInit): Promise<T> {
   const r = await fetch(url, init)
   if (!r.ok) {
@@ -101,6 +126,24 @@ export const api = {
     req<{ ok: boolean }>(`/api/hosts/${encodeURIComponent(name)}/test`, {
       method: 'POST',
     }),
+  exportHosts: async () => {
+    const r = await fetch('/api/hosts/export')
+    if (!r.ok) {
+      let msg = `HTTP ${r.status}`
+      try { const j = await r.json(); if (j.error) msg = j.error } catch { /* */ }
+      throw new Error(msg)
+    }
+    return r.json() as Promise<{ version: number; hosts: HostImportItem[] }>
+  },
+  importHosts: (hosts: HostImportItem[], onDuplicate: 'skip' | 'overwrite') =>
+    req<{ ok: boolean; imported: number; skipped: number; overwritten: number }>(
+      '/api/hosts/import',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hosts, on_duplicate: onDuplicate }),
+      }
+    ),
   presets: () => req<Preset[]>('/api/presets'),
   savePreset: (p: Preset) =>
     req<{ ok: boolean }>('/api/presets', {
@@ -131,6 +174,26 @@ export const api = {
       body: JSON.stringify({ host, maps }),
     }),
   pushStatus: (runId: number) => req<RunStatus>(`/api/push/status/${runId}`),
+
+  // File operations
+  listFiles: (host: string, path: string) =>
+    req<{ entries: FileEntry[] }>(
+      `/api/files/${encodeURIComponent(host)}/list?path=${encodeURIComponent(path)}`
+    ),
+  readFile: (host: string, path: string) =>
+    req<{ content: string; size: number }>(
+      `/api/files/${encodeURIComponent(host)}/read?path=${encodeURIComponent(path)}`
+    ),
+  writeFile: (host: string, path: string, content: string) =>
+    req<{ ok: boolean }>(`/api/files/${encodeURIComponent(host)}/write`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path, content }),
+    }),
+  statFile: (host: string, path: string) =>
+    req<{ stat: FileStat }>(
+      `/api/files/${encodeURIComponent(host)}/stat?path=${encodeURIComponent(path)}`
+    ),
 }
 
 export function fmtSize(n: number): string {

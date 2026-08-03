@@ -12,11 +12,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { Plug, Unplug } from 'lucide-react'
+import { Plug, Unplug, Bot } from 'lucide-react'
+import { AiChatPanel } from '@/components/ai-chat-panel'
 
 export function TerminalPage({ hosts }: { hosts: HostItem[] }) {
   const [host, setHost] = useState('')
   const [connected, setConnected] = useState(false)
+  const [aiOpen, setAiOpen] = useState(false)
   const boxRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
@@ -62,6 +64,7 @@ export function TerminalPage({ hosts }: { hosts: HostItem[] }) {
       fit.fit()
     }
     term.writeln('选择主机后点击「连接」开始会话。')
+    term.writeln('点击「AI 助手」可使用 AI 辅助巡检和诊断。')
     termRef.current = term
     fitRef.current = fit
 
@@ -123,7 +126,11 @@ export function TerminalPage({ hosts }: { hosts: HostItem[] }) {
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-lg font-semibold">终端</h2>
-          <p className="text-muted-foreground text-sm">连接后可直接执行远程命令（如重启服务）</p>
+          <p className="text-muted-foreground text-sm">
+            {connected
+              ? '已连接 — 可直接执行远程命令'
+              : '连接后可直接执行远程命令（如重启服务）'}
+          </p>
         </div>
         <div className="flex items-center gap-2">
           {connected && (
@@ -152,10 +159,32 @@ export function TerminalPage({ hosts }: { hosts: HostItem[] }) {
               <Plug /> 连接
             </Button>
           )}
+          <Button
+            variant={aiOpen ? 'default' : 'outline'}
+            size="icon"
+            className="size-9"
+            onClick={() => setAiOpen(!aiOpen)}
+            title="AI 助手"
+          >
+            <Bot className="size-4" />
+          </Button>
         </div>
       </div>
-      <div className="min-h-0 flex-1 overflow-hidden rounded-lg border bg-white p-2">
-        <div ref={boxRef} className="h-full w-full" />
+      <div className="min-h-0 flex-1 flex gap-3 overflow-hidden">
+        {/* 终端 */}
+        <div
+          className={`min-h-0 flex-1 overflow-hidden rounded-lg border bg-white p-2 ${
+            aiOpen ? '' : 'w-full'
+          }`}
+        >
+          <div ref={boxRef} className="h-full w-full" />
+        </div>
+        {/* AI 面板 */}
+        {aiOpen && (
+          <div className="w-96 shrink-0 overflow-hidden rounded-lg border bg-background">
+            <AiChatPanel host={host} />
+          </div>
+        )}
       </div>
     </div>
   )

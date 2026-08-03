@@ -1,4 +1,7 @@
+mod aiservice;
+mod approval;
 mod config;
+mod fileops;
 mod logdb;
 mod push;
 mod repl;

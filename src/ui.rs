@@ -1,4 +1,6 @@
+use crate::approval;
 use crate::config::{self, HostConfig};
+use crate::fileops;
 use crate::logdb;
 use crate::push;
 use crate::sshconn;
@@ -13,6 +15,7 @@ use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
@@ -20,6 +23,10 @@ use std::time::Instant;
 #[derive(RustEmbed)]
 #[folder = "web/dist"]
 struct Assets;
+
+#[derive(RustEmbed)]
+#[folder = "ai/dist"]
+pub(crate) struct AiAssets;
 
 struct AppError(anyhow::Error);
 
@@ -47,10 +54,15 @@ pub fn run(port: u16) -> Result<()> {
 }
 
 async fn serve(port: u16) -> Result<()> {
+    // 尝试启动 AI 服务
+    let _ = crate::aiservice::spawn_if_enabled();
+
     let app = Router::new()
         .route("/api/hosts", get(hosts_list).post(hosts_save))
         .route("/api/hosts/:name", delete(hosts_delete))
         .route("/api/hosts/:name/test", post(hosts_test))
+        .route("/api/hosts/export", get(hosts_export))
+        .route("/api/hosts/import", post(hosts_import))
         .route("/api/presets", get(presets_list).post(presets_save))
         .route("/api/presets/:name", delete(presets_delete))
         .route("/api/logs", get(logs_list))
@@ -59,6 +71,18 @@ async fn serve(port: u16) -> Result<()> {
         .route("/api/push/run", post(push_run))
         .route("/api/push/status/:id", get(push_status))
         .route("/api/term/:name", get(term_ws))
+        .route("/api/files/:host/list", get(files_list))
+        .route("/api/files/:host/read", get(files_read))
+        .route("/api/files/:host/write", post(files_write))
+        .route("/api/files/:host/stat", get(files_stat))
+        .route("/api/ai/stream/:host", get(ai_stream_ws))
+        .route("/api/ai/exec-command", post(ai_exec_command))
+        .route("/api/ai/request-approval", post(ai_request_approval))
+        .route("/api/ai/approvals", get(ai_list_approvals))
+        .route("/api/ai/approve/:id", post(ai_approve))
+        .route("/api/ai/reject/:id", post(ai_reject))
+        .route("/api/ai/chat-stream", post(ai_chat_stream))
+        .route("/api/ai/config", get(ai_get_config).post(ai_save_config))
         .fallback(static_handler);
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
@@ -166,6 +190,99 @@ async fn hosts_test(Path(name): Path<String>) -> ApiResult<Json<serde_json::Valu
     })
     .await??;
     Ok(Json(json!({ "ok": true })))
+}
+
+// ---------- hosts export / import ----------
+
+/// 导出所有主机为 JSON（不含密码/密钥等敏感凭据）
+async fn hosts_export() -> ApiResult<Json<serde_json::Value>> {
+    let hosts = tokio::task::spawn_blocking(|| -> Result<serde_json::Value> {
+        let cfg = config::load_hosts()?;
+        let items: Vec<serde_json::Value> = cfg
+            .into_iter()
+            .map(|(name, h)| {
+                json!({
+                    "name": name,
+                    "host": h.host,
+                    "port": h.port,
+                    "user": h.user,
+                    "remote_root": h.remote_root,
+                    "note": h.note,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "version": 1,
+            "hosts": items,
+        }))
+    })
+    .await??;
+    Ok(Json(hosts))
+}
+
+/// 导入主机配置
+#[derive(Deserialize)]
+struct HostsImportReq {
+    hosts: Vec<HostImportItem>,
+    #[serde(default = "default_dup")]
+    on_duplicate: String,
+}
+
+fn default_dup() -> String { "skip".into() }
+
+#[derive(Deserialize)]
+struct HostImportItem {
+    name: String,
+    host: String,
+    #[serde(default = "default_import_port")]
+    port: u16,
+    user: String,
+    remote_root: Option<String>,
+    note: Option<String>,
+}
+
+fn default_import_port() -> u16 { 22 }
+
+async fn hosts_import(Json(req): Json<HostsImportReq>) -> ApiResult<Json<serde_json::Value>> {
+    let result = tokio::task::spawn_blocking(move || -> Result<serde_json::Value> {
+        let mut existing = config::load_hosts()?;
+        let mut imported = 0usize;
+        let mut skipped = 0usize;
+        let mut overwritten = 0usize;
+
+        for item in req.hosts {
+            let entry = config::HostConfig {
+                host: item.host,
+                port: item.port,
+                user: item.user,
+                key_path: None,
+                remote_root: item.remote_root,
+                note: item.note,
+            };
+            match existing.get(&item.name) {
+                Some(_) => match req.on_duplicate.as_str() {
+                    "overwrite" => {
+                        existing.insert(item.name, entry);
+                        overwritten += 1;
+                    }
+                    _ => { skipped += 1; }
+                },
+                None => {
+                    existing.insert(item.name, entry);
+                    imported += 1;
+                }
+            }
+        }
+        config::save_hosts(&existing)?;
+        Ok(json!({
+            "ok": true,
+            "imported": imported,
+            "skipped": skipped,
+            "overwritten": overwritten,
+        }))
+    })
+    .await??;
+    Ok(Json(result))
 }
 
 // ---------- presets ----------
@@ -568,6 +685,317 @@ async fn handle_term(mut socket: WebSocket, name: String) {
             },
         }
     }
+}
+
+// ---------- file operations (SFTP) ----------
+
+#[derive(Deserialize)]
+struct FilePathQuery {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct WriteFileReq {
+    path: String,
+    content: String,
+}
+
+async fn files_list(
+    Path(host): Path<String>,
+    Query(q): Query<FilePathQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let path = q.path.clone();
+    let entries = tokio::task::spawn_blocking(move || -> Result<Vec<fileops::FileEntry>> {
+        let cfg = config::get_host(&host)?;
+        let cred = sshconn::resolve_cred_stored(&host, &cfg)?;
+        let sess = sshconn::open_session(&cfg, &cred)?;
+        let sftp = sess.sftp()?;
+        fileops::list_dir(&sftp, &path)
+    })
+    .await??;
+    Ok(Json(json!({ "entries": entries })))
+}
+
+async fn files_read(
+    Path(host): Path<String>,
+    Query(q): Query<FilePathQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let path = q.path.clone();
+    let content = tokio::task::spawn_blocking(move || -> Result<String> {
+        let cfg = config::get_host(&host)?;
+        let cred = sshconn::resolve_cred_stored(&host, &cfg)?;
+        let sess = sshconn::open_session(&cfg, &cred)?;
+        let sftp = sess.sftp()?;
+        fileops::read_file(&sftp, &path)
+    })
+    .await??;
+    Ok(Json(json!({ "content": content, "size": content.len() })))
+}
+
+async fn files_write(
+    Path(host): Path<String>,
+    Json(req): Json<WriteFileReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let path = req.path.clone();
+    let content = req.content.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let cfg = config::get_host(&host)?;
+        let cred = sshconn::resolve_cred_stored(&host, &cfg)?;
+        let sess = sshconn::open_session(&cfg, &cred)?;
+        let sftp = sess.sftp()?;
+        fileops::write_file(&sftp, &path, &content)
+    })
+    .await??;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn files_stat(
+    Path(host): Path<String>,
+    Query(q): Query<FilePathQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let path = q.path.clone();
+    let stat = tokio::task::spawn_blocking(move || -> Result<fileops::FileStat> {
+        let cfg = config::get_host(&host)?;
+        let cred = sshconn::resolve_cred_stored(&host, &cfg)?;
+        let sess = sshconn::open_session(&cfg, &cred)?;
+        let sftp = sess.sftp()?;
+        fileops::stat_path(&sftp, &path)
+    })
+    .await??;
+    Ok(Json(json!({ "stat": stat })))
+}
+
+// ---------- AI routes ----------
+
+#[derive(Deserialize)]
+struct AiExecReq {
+    host: String,
+    command: String,
+}
+
+#[derive(Deserialize)]
+struct AiApprovalReq {
+    host: String,
+    command: String,
+}
+
+async fn ai_stream_ws(ws: WebSocketUpgrade, Path(host): Path<String>) -> Response {
+    ws.on_upgrade(move |socket| handle_ai_stream(socket, host))
+}
+
+async fn handle_ai_stream(mut socket: WebSocket, _host: String) {
+    use tokio::sync::mpsc;
+    let (tx, mut rx) = mpsc::channel::<String>(32);
+    let send_handle = tokio::spawn(async move {
+        while let Some(Ok(msg)) = socket.recv().await {
+            match msg {
+                Message::Text(t) => {
+                    if tx.send(t).await.is_err() {
+                        break;
+                    }
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+    });
+    let _ = send_handle.await;
+    while rx.try_recv().is_ok() {}
+}
+
+async fn ai_exec_command(Json(req): Json<AiExecReq>) -> ApiResult<Json<serde_json::Value>> {
+    let host = req.host.clone();
+    let command = req.command.clone();
+    let risk = approval::classify_risk(&command);
+    if risk == approval::RiskLevel::Dangerous {
+        let (_approval_id, rx) = approval::submit_approval(&host, &command);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(35), rx).await;
+        match result {
+            Ok(Ok(r)) if r.approved => {}
+            Ok(Ok(r)) => {
+                return Ok(Json(json!({
+                    "stdout": "",
+                    "stderr": r.rejected_reason.unwrap_or("已拒绝".to_string()),
+                    "exit_code": 1
+                })));
+            }
+            _ => {
+                return Ok(Json(json!({
+                    "stdout": "",
+                    "stderr": "审批超时或已取消".to_string(),
+                    "exit_code": 1
+                })));
+            }
+        }
+    }
+    let output = tokio::task::spawn_blocking(move || -> Result<(String, String, i32)> {
+        let cfg = config::get_host(&host)?;
+        let cred = sshconn::resolve_cred_stored(&host, &cfg)?;
+        let sess = sshconn::open_session(&cfg, &cred)?;
+        let mut ch = sess.channel_session()?;
+        ch.exec(&command)?;
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        ch.read_to_string(&mut stdout)?;
+        ch.stderr().read_to_string(&mut stderr)?;
+        ch.wait_close()?;
+        let exit_code = ch.exit_status()?;
+        Ok((stdout, stderr, exit_code))
+    })
+    .await??;
+    Ok(Json(json!({
+        "stdout": output.0,
+        "stderr": output.1,
+        "exit_code": output.2
+    })))
+}
+
+async fn ai_request_approval(
+    Json(req): Json<AiApprovalReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let (id, rx) = approval::submit_approval(&req.host, &req.command);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(35), rx).await;
+    match result {
+        Ok(Ok(r)) => Ok(Json(json!({
+            "result": {
+                "id": r.id,
+                "approved": r.approved,
+                "rejected_reason": r.rejected_reason
+            }
+        }))),
+        _ => Ok(Json(json!({
+            "result": {
+                "id": id,
+                "approved": false,
+                "rejected_reason": "审批超时"
+            }
+        }))),
+    }
+}
+
+async fn ai_list_approvals() -> ApiResult<Json<Vec<approval::ApprovalRequest>>> {
+    Ok(Json(approval::pending_approvals()))
+}
+
+async fn ai_approve(Path(id): Path<String>) -> ApiResult<Json<serde_json::Value>> {
+    let ok = approval::approve(&id);
+    Ok(Json(json!({ "ok": ok })))
+}
+
+#[derive(Deserialize)]
+struct RejectBody {
+    reason: Option<String>,
+}
+
+async fn ai_reject(
+    Path(id): Path<String>,
+    Json(body): Json<RejectBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let ok = approval::reject(&id, body.reason);
+    Ok(Json(json!({ "ok": ok })))
+}
+
+/// SSE 代理：转发聊天请求到 AI Service
+async fn ai_chat_stream(
+    Json(req): Json<serde_json::Value>,
+) -> Response {
+    use axum::http::StatusCode;
+    use axum::body::Body;
+    use futures::StreamExt;
+
+    let ai_port = 7799u16;
+    let ai_url = format!("http://127.0.0.1:{ai_port}/chat/stream");
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("AI 客户端初始化失败: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    match client.post(&ai_url).json(&req).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let headers = [
+                (header::CONTENT_TYPE, "text/event-stream"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ];
+            let stream = resp.bytes_stream().map(|r| {
+                r.map(|b| axum::body::Bytes::from(b.to_vec()))
+                    .map_err(std::io::Error::other)
+            });
+            let body = Body::from_stream(stream);
+            (StatusCode::OK, headers, body).into_response()
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            (
+                status,
+                Json(json!({ "error": body })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": format!("AI 服务不可用: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+/// 获取 AI 配置（api_key 用占位符，不泄露）
+async fn ai_get_config() -> ApiResult<Json<serde_json::Value>> {
+    let cfg = tokio::task::spawn_blocking(config::load_ai_config).await??;
+    let has_key = config::get_ai_api_key().is_some();
+    Ok(Json(json!({
+        "enabled": cfg.enabled,
+        "provider": cfg.provider,
+        "base_url": cfg.base_url,
+        "model": cfg.model,
+        "port": cfg.port,
+        "has_api_key": has_key,
+    })))
+}
+
+/// 保存 AI 配置
+#[derive(Deserialize)]
+struct AiConfigReq {
+    enabled: Option<bool>,
+    provider: Option<String>,
+    base_url: Option<String>,
+    model: Option<String>,
+    port: Option<u16>,
+    api_key: Option<String>,
+}
+
+async fn ai_save_config(Json(req): Json<AiConfigReq>) -> ApiResult<Json<serde_json::Value>> {
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut cfg = config::load_ai_config()?;
+        if let Some(v) = req.enabled { cfg.enabled = v; }
+        if let Some(v) = req.provider { cfg.provider = v; }
+        if let Some(v) = req.base_url { cfg.base_url = v; }
+        if let Some(v) = req.model { cfg.model = v; }
+        if let Some(v) = req.port { cfg.port = v; }
+        config::save_ai_config(&cfg)?;
+        // API Key 单独存钥匙串
+        if let Some(key) = req.api_key {
+            if key.is_empty() {
+                config::delete_ai_api_key();
+            } else {
+                config::set_ai_api_key(&key)?;
+            }
+        }
+        Ok(())
+    })
+    .await??;
+    Ok(Json(json!({ "ok": true })))
 }
 
 // ---------- static assets ----------

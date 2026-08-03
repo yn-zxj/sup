@@ -11,10 +11,12 @@ chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.27"
 dirs = "5"
+futures = "0.3"
 indicatif = "0.17"
 keyring = "2"
 mime_guess = "2"
 open = "5"
+reqwest = { version = "0.12", features = ["json", "stream"] }
 rpassword = "7"
 rusqlite = { version = "0.31", features = ["bundled"] }
 rust-embed = "8"
