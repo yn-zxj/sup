@@ -21,6 +21,28 @@ use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
+use tokio::sync::broadcast;
+
+/// AI 命令执行事件（广播到 Web 终端）
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type")]
+pub enum AiCommandEvent {
+    #[serde(rename = "exec")]
+    Exec { host: String, command: String },
+    #[serde(rename = "result")]
+    Result { host: String, command: String, exit_code: i32, stdout: String, stderr: String },
+}
+
+static COMMAND_TX: OnceLock<broadcast::Sender<AiCommandEvent>> = OnceLock::new();
+
+fn command_tx() -> &'static broadcast::Sender<AiCommandEvent> {
+    COMMAND_TX.get_or_init(|| broadcast::channel(32).0)
+}
+
+/// 广播 AI 命令事件
+pub fn broadcast_command_event(event: AiCommandEvent) {
+    let _ = command_tx().send(event);
+}
 
 #[derive(RustEmbed)]
 #[folder = "web/dist"]
@@ -96,6 +118,7 @@ async fn serve(port: u16) -> Result<()> {
         .route("/api/ai/request-approval", post(ai_request_approval))
         .route("/api/ai/approvals", get(ai_list_approvals))
         .route("/api/ai/approvals-stream", get(ai_approvals_sse))
+        .route("/api/ai/commands-stream", get(ai_commands_sse))
         .route("/api/ai/approve/:id", post(ai_approve))
         .route("/api/ai/reject/:id", post(ai_reject))
         .route("/api/ai/chat-stream", post(ai_chat_stream))
@@ -823,6 +846,13 @@ async fn handle_ai_stream(mut socket: WebSocket, _host: String) {
 async fn ai_exec_command(Json(req): Json<AiExecReq>) -> ApiResult<Json<serde_json::Value>> {
     let host = req.host.clone();
     let command = req.command.clone();
+
+    // 广播命令执行事件到 Web 终端
+    broadcast_command_event(AiCommandEvent::Exec {
+        host: host.clone(),
+        command: command.clone(),
+    });
+
     let risk = approval::classify_risk(&command);
     if risk == approval::RiskLevel::Dangerous {
         let (_approval_id, rx) = approval::submit_approval(&host, &command);
@@ -845,6 +875,8 @@ async fn ai_exec_command(Json(req): Json<AiExecReq>) -> ApiResult<Json<serde_jso
             }
         }
     }
+    let host2 = host.clone();
+    let cmd2 = command.clone();
     let output = tokio::task::spawn_blocking(move || -> Result<(String, String, i32)> {
         let cfg = config::get_host(&host)?;
         let cred = sshconn::resolve_cred_stored(&host, &cfg)?;
@@ -860,6 +892,16 @@ async fn ai_exec_command(Json(req): Json<AiExecReq>) -> ApiResult<Json<serde_jso
         Ok((stdout, stderr, exit_code))
     })
     .await??;
+
+    // 广播命令执行结果（完整 stdout/stderr）
+    broadcast_command_event(AiCommandEvent::Result {
+        host: host2,
+        command: cmd2,
+        exit_code: output.2,
+        stdout: output.0.clone(),
+        stderr: output.1.clone(),
+    });
+
     Ok(Json(json!({
         "stdout": output.0,
         "stderr": output.1,
@@ -926,6 +968,29 @@ async fn ai_approvals_sse() -> Sse<impl Stream<Item = std::result::Result<Event,
     });
 
     let stream = initial_stream.chain(event_stream);
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// SSE 命令执行事件流（推送到 Web 终端）
+async fn ai_commands_sse() -> Sse<impl Stream<Item = std::result::Result<Event, std::convert::Infallible>>> {
+    use futures::StreamExt;
+    use tokio_stream::wrappers::BroadcastStream;
+
+    let rx = command_tx().subscribe();
+    let stream = BroadcastStream::new(rx).filter_map(|result| {
+        futures::future::ready(match result {
+            Ok(event) => {
+                let json = serde_json::to_string(&event).unwrap_or_default();
+                let event_type = match &event {
+                    AiCommandEvent::Exec { .. } => "exec",
+                    AiCommandEvent::Result { .. } => "result",
+                };
+                Some(Ok(Event::default().event(event_type).data(json)))
+            }
+            Err(_) => None,
+        })
+    });
+
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 

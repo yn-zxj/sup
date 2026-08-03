@@ -40,6 +40,22 @@ interface AiChatPanelProps {
   onCommandReject?: (approvalId: string) => void
 }
 
+/** Markdown 渲染组件（带错误兜底） */
+function MarkdownContent({ content }: { content: string }) {
+  try {
+    return (
+      <div className="prose prose-sm dark:prose-invert max-w-none prose-headings:text-foreground prose-p:text-sm prose-p:leading-relaxed prose-code:text-xs prose-code:bg-muted-foreground/10 prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-pre:bg-zinc-950 prose-pre:text-zinc-100 prose-pre:text-xs prose-pre:rounded-lg prose-a:text-primary prose-strong:text-foreground prose-li:text-sm prose-table:text-xs">
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+          {content}
+        </ReactMarkdown>
+      </div>
+    )
+  } catch {
+    // 渲染失败时回退到纯文本
+    return <pre className="text-xs whitespace-pre-wrap break-all max-h-96 overflow-auto">{content}</pre>
+  }
+}
+
 export function AiChatPanel({ host, onCommandApprove, onCommandReject }: AiChatPanelProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
@@ -59,9 +75,11 @@ export function AiChatPanel({ host, onCommandApprove, onCommandReject }: AiChatP
 
   const updateLastAssistant = useCallback((content: string) => {
     setMessages((prev) => {
-      const last = prev[prev.length - 1]
-      if (last && last.role === 'assistant') {
-        return [...prev.slice(0, -1), { ...last, content }]
+      // 从尾部查找最后一个 assistant 消息（工具消息可能插在中间）
+      for (let i = prev.length - 1; i >= 0; i--) {
+        if (prev[i].role === 'assistant') {
+          return [...prev.slice(0, i), { ...prev[i], content }, ...prev.slice(i + 1)]
+        }
       }
       return prev
     })
@@ -260,11 +278,7 @@ export function AiChatPanel({ host, onCommandApprove, onCommandReject }: AiChatP
             </div>
             <div className="bg-muted rounded-lg px-3 py-2 text-sm max-w-[85%]">
               {msg.content ? (
-                <div className="prose prose-sm dark:prose-invert max-w-none prose-headings:text-foreground prose-p:text-sm prose-p:leading-relaxed prose-code:text-xs prose-code:bg-muted-foreground/10 prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-pre:bg-zinc-950 prose-pre:text-zinc-100 prose-pre:text-xs prose-pre:rounded-lg prose-a:text-primary prose-strong:text-foreground prose-li:text-sm prose-table:text-xs">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                    {msg.content}
-                  </ReactMarkdown>
-                </div>
+                <MarkdownContent content={msg.content} />
               ) : (
                 <span className="inline-flex items-center gap-1 text-muted-foreground">
                   <Loader2 className="size-3 animate-spin" />

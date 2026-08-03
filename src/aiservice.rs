@@ -98,13 +98,45 @@ pub fn spawn_if_enabled(backend_port: u16) -> Result<()> {
     }
 }
 
+/// 解析可写入的临时目录（多级回退）
+fn resolve_temp_dir() -> Result<PathBuf> {
+    let pid = std::process::id();
+    let dir_name = format!("sup-ai-{pid}");
+
+    // 候选路径（按优先级）
+    let candidates: Vec<PathBuf> = vec![
+        std::env::temp_dir().join(&dir_name),
+        PathBuf::from("/tmp").join(&dir_name),
+        dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("sup")
+            .join("ai-bundle"),
+    ];
+
+    for candidate in &candidates {
+        if fs::create_dir_all(candidate).is_ok() {
+            // 验证可写
+            let test = candidate.join(".write_test");
+            if fs::write(&test, b"ok").is_ok() {
+                let _ = fs::remove_file(&test);
+                return Ok(candidate.clone());
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "无法在任何已知路径创建临时目录，尝试了: {:?}",
+        candidates
+    )
+}
+
 fn start(ai_cfg: &crate::config::AiConfig, api_key: &str, backend_port: u16) -> Result<()> {
     // 从嵌入式资源中解压 AI bundle 到临时目录
     let embedded = crate::ui::AiAssets::get("index.cjs")
         .context("AI 服务未内嵌（构建前请执行 cd ai && npm run bundle）")?;
 
-    // 在系统临时目录创建 sup-ai 专用目录
-    let tmp_dir = std::env::temp_dir().join(format!("sup-ai-{}", std::process::id()));
+    // 创建临时目录（多级回退，兼容沙箱环境）
+    let tmp_dir = resolve_temp_dir().context("无法创建 AI 临时目录")?;
     let _ = fs::remove_dir_all(&tmp_dir); // 清理上次残留
     fs::create_dir_all(&tmp_dir).context("无法创建 AI 临时目录")?;
 

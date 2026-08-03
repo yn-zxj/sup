@@ -71,6 +71,7 @@ function getLang(path: string): string {
 
 export function FileEditorPage({ hosts }: { hosts: HostItem[] }) {
   const [host, setHost] = useState('')
+  const [connected, setConnected] = useState(false)
   const [rootPath, setRootPath] = useState('/')
   const [tree, setTree] = useState<TreeNode[]>([])
   const [treeLoading, setTreeLoading] = useState(false)
@@ -86,6 +87,26 @@ export function FileEditorPage({ hosts }: { hosts: HostItem[] }) {
   useEffect(() => {
     if (!host && hosts.length > 0) setHost(hosts[0].name)
   }, [hosts, host])
+
+  // 点击「连接」按钮手动加载
+  const handleConnect = () => {
+    if (!host) return
+    setTreeLoading(true)
+    loadRoot().finally(() => setConnected(true))
+  }
+
+  // 断开连接
+  const handleDisconnect = () => {
+    setTree([])
+    setConnected(false)
+    setOpenFile(null)
+    setFileContent('')
+  }
+
+  // 切换主机时重置
+  useEffect(() => {
+    if (connected) handleDisconnect()
+  }, [host])
 
   // 加载根目录
   const loadRoot = useCallback(async () => {
@@ -103,14 +124,13 @@ export function FileEditorPage({ hosts }: { hosts: HostItem[] }) {
       )
     } catch (err) {
       toast.error(`加载目录失败: ${(err as Error).message}`)
+      throw err
     } finally {
       setTreeLoading(false)
     }
   }, [host, rootPath])
 
-  useEffect(() => {
-    loadRoot()
-  }, [loadRoot])
+  // 不再自动加载，而是手动点击「连接」
 
   // 加载子目录
   const toggleExpand = async (node: TreeNode) => {
@@ -287,7 +307,20 @@ export function FileEditorPage({ hosts }: { hosts: HostItem[] }) {
               ))}
             </SelectContent>
           </Select>
-          <div className="flex items-center gap-1 rounded-md border">
+          {connected ? (
+            <Button variant="outline" size="sm" onClick={handleDisconnect}>
+              断开
+            </Button>
+          ) : (
+            <Button size="sm" onClick={handleConnect} disabled={!host || treeLoading}>
+              {treeLoading ? (
+                <Loader2 className="size-3.5 animate-spin mr-1" />
+              ) : null}
+              连接
+            </Button>
+          )}
+          {connected && (
+            <div className="flex items-center gap-1 rounded-md border">
             <Input
               className="h-8 w-48 border-0 text-xs font-mono"
               value={rootPath}
@@ -298,7 +331,8 @@ export function FileEditorPage({ hosts }: { hosts: HostItem[] }) {
             <Button variant="ghost" size="icon" className="size-7" onClick={loadRoot}>
               <RefreshCw className="size-3.5" />
             </Button>
-          </div>
+            </div>
+          )}
         </div>
       </div>
 
@@ -311,9 +345,13 @@ export function FileEditorPage({ hosts }: { hosts: HostItem[] }) {
               <Loader2 className="size-4 animate-spin" />
               加载中...
             </div>
-          ) : tree.length === 0 ? (
+          ) : tree.length === 0 && connected ? (
             <div className="p-4 text-sm text-muted-foreground">
               目录为空或无法访问
+            </div>
+          ) : !connected ? (
+            <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
+              请选择主机后点击「连接」
             </div>
           ) : (
             <div className="py-1">{tree.map((node) => renderNode(node, 0))}</div>

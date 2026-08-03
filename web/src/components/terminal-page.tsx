@@ -121,6 +121,52 @@ export function TerminalPage({ hosts }: { hosts: HostItem[] }) {
     ws.addEventListener('close', () => sub.dispose())
   }
 
+  // AI 命令事件流 — 在终端中同步展示 AI 执行的命令
+  useEffect(() => {
+    const es = new EventSource('/api/ai/commands-stream')
+
+    es.addEventListener('exec', (e) => {
+      try {
+        const { host: evHost, command } = JSON.parse(e.data)
+        if (evHost === host && termRef.current) {
+          termRef.current.writeln(`\r\n\x1b[36m[AI 执行]\x1b[0m ${command}`)
+        }
+      } catch { /* ignore */ }
+    })
+
+    es.addEventListener('result', (e) => {
+      try {
+        const { host: evHost, exit_code, stdout, stderr } = JSON.parse(e.data)
+        if (evHost === host && termRef.current) {
+          const term = termRef.current
+          // 显示完整 stdout
+          if (stdout) {
+            const lines = stdout.split('\n')
+            for (const line of lines) {
+              term.writeln(`  \x1b[90m│\x1b[0m ${line}`)
+            }
+          }
+          if (stderr && stderr.length > 0) {
+            term.writeln(`  \x1b[31mstderr:\x1b[0m`)
+            const lines = stderr.split('\n')
+            for (const line of lines) {
+              term.writeln(`  \x1b[31m│\x1b[0m ${line}`)
+            }
+          }
+          const status = exit_code === 0
+            ? '\x1b[32m✓ 成功\x1b[0m'
+            : `\x1b[31m✗ 失败 (exit ${exit_code})\x1b[0m`
+          const info = stdout || stderr
+            ? `stdout: ${stdout?.length || 0}B  stderr: ${stderr?.length || 0}B`
+            : ''
+          term.writeln(`  ${status}${info ? '  ' + info : ''}`)
+        }
+      } catch { /* ignore */ }
+    })
+
+    return () => es.close()
+  }, [host])
+
   return (
     <div className="flex h-full flex-col gap-4 p-4 lg:p-6">
       <div className="flex items-center justify-between">
