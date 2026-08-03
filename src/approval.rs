@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::broadcast;
 
 /// 命令风险等级
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,6 +173,30 @@ pub fn classify_risk(command: &str) -> RiskLevel {
     RiskLevel::Dangerous
 }
 
+/// 审批事件（用于 SSE 推送）
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type")]
+pub enum ApprovalEvent {
+    #[serde(rename = "new")]
+    New(ApprovalRequest),
+    #[serde(rename = "approved")]
+    Approved { id: String },
+    #[serde(rename = "rejected")]
+    Rejected { id: String, reason: Option<String> },
+}
+
+/// 广播通道（容量 16，避免慢消费者阻塞）
+static EVENT_TX: OnceLock<broadcast::Sender<ApprovalEvent>> = OnceLock::new();
+
+fn event_tx() -> &'static broadcast::Sender<ApprovalEvent> {
+    EVENT_TX.get_or_init(|| broadcast::channel(16).0)
+}
+
+/// 订阅审批事件流
+pub fn subscribe_events() -> broadcast::Receiver<ApprovalEvent> {
+    event_tx().subscribe()
+}
+
 /// 提交审批请求，返回 oneshot receiver 等待审批结果
 pub fn submit_approval(
     host: &str,
@@ -193,15 +218,18 @@ pub fn submit_approval(
     approvals().lock().unwrap().insert(
         id.clone(),
         ApprovalState {
-            request,
+            request: request.clone(),
             result_tx: tx,
         },
     );
 
+    // 广播新审批事件
+    let _ = event_tx().send(ApprovalEvent::New(request));
+
     (id, rx)
 }
 
-/// 获取所有待审批的请求（用于前端轮询或 WebSocket 推送）
+/// 获取所有待审批的请求（同时清理超时并广播拒绝事件）
 pub fn pending_approvals() -> Vec<ApprovalRequest> {
     let now = Instant::now();
     let mut lock = approvals().lock().unwrap();
@@ -213,10 +241,15 @@ pub fn pending_approvals() -> Vec<ApprovalRequest> {
         .collect();
     for k in timeout_keys {
         if let Some(state) = lock.remove(&k) {
+            let id = k.clone();
             let _ = state.result_tx.send(ApprovalResult {
-                id: k.clone(),
+                id: id.clone(),
                 approved: false,
                 rejected_reason: Some("审批超时自动拒绝".to_string()),
+            });
+            let _ = event_tx().send(ApprovalEvent::Rejected {
+                id,
+                reason: Some("审批超时自动拒绝".to_string()),
             });
         }
     }
@@ -233,6 +266,7 @@ pub fn approve(id: &str) -> bool {
             approved: true,
             rejected_reason: None,
         });
+        let _ = event_tx().send(ApprovalEvent::Approved { id: id.to_string() });
         true
     } else {
         false
@@ -245,8 +279,9 @@ pub fn reject(id: &str, reason: Option<String>) -> bool {
         let _ = state.result_tx.send(ApprovalResult {
             id: id.to_string(),
             approved: false,
-            rejected_reason: reason.or_else(|| Some("用户拒绝".to_string())),
+            rejected_reason: reason.clone(),
         });
+        let _ = event_tx().send(ApprovalEvent::Rejected { id: id.to_string(), reason });
         true
     } else {
         false
@@ -255,7 +290,6 @@ pub fn reject(id: &str, reason: Option<String>) -> bool {
 
 /// 生成简易 UUID v4
 fn uuid_v4() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
     let t = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -266,8 +300,8 @@ fn uuid_v4() -> String {
         r.wrapping_mul(1103515245).wrapping_add(12345),
         (r >> 16) & 0xFFFF,
         r & 0xFFF,
-        0x8000 | (r & 0x3FFF),
-        t & 0xFFFFFFFFFFFF
+        0x8000u32 | (r & 0x3FFF),
+        (t as u64) & 0xFFFF_FFFF_FFFF
     )
 }
 

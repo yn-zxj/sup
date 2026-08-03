@@ -16,6 +16,8 @@ import {
   ChevronUp,
   Settings,
 } from 'lucide-react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import { AiSettingsDialog } from '@/components/ai-settings-dialog'
 
 interface ChatMessage {
@@ -151,48 +153,71 @@ export function AiChatPanel({ host, onCommandApprove, onCommandReject }: AiChatP
     }
   }
 
-  // 轮询审批请求
+  // SSE 审批事件流（替代轮询）
   useEffect(() => {
-    const interval = setInterval(async () => {
+    const es = new EventSource('/api/ai/approvals-stream')
+
+    es.addEventListener('new', (e) => {
       try {
-        const res = await fetch('/api/ai/approvals')
-        if (!res.ok) return
-        const approvals = await res.json() as ApprovalItem[]
-        for (const a of approvals) {
-          // 检查是否已存在
-          setMessages((prev) => {
-            const exists = prev.some((m) => m.approvalId === a.id)
-            if (exists) return prev
-            return [
-              ...prev,
-              {
-                id: `apr-${a.id}`,
-                role: 'approval',
-                content: `等待审批: ${a.command}`,
-                approvalId: a.id,
-                command: a.command,
-                risk: a.risk,
-                timestamp: Date.now(),
-              },
-            ]
-          })
-        }
+        const a = JSON.parse(e.data) as ApprovalItem
+        setMessages((prev) => {
+          const exists = prev.some((m) => m.approvalId === a.id)
+          if (exists) return prev
+          return [
+            ...prev,
+            {
+              id: `apr-${a.id}`,
+              role: 'approval' as const,
+              content: `等待审批: ${a.command}`,
+              approvalId: a.id,
+              command: a.command,
+              risk: a.risk,
+              timestamp: Date.now(),
+            },
+          ]
+        })
+      } catch {
+        /* ignore parse error */
+      }
+    })
+
+    es.addEventListener('approved', (e) => {
+      try {
+        const { id } = JSON.parse(e.data)
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.approvalId === id ? { ...m, role: 'system' as const, content: `已批准: ${m.command}` } : m
+          )
+        )
       } catch {
         /* ignore */
       }
-    }, 2000)
+    })
 
-    return () => clearInterval(interval)
+    es.addEventListener('rejected', (e) => {
+      try {
+        const { id } = JSON.parse(e.data)
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.approvalId === id ? { ...m, role: 'system' as const, content: `已拒绝: ${m.command}` } : m
+          )
+        )
+      } catch {
+        /* ignore */
+      }
+    })
+
+    es.onerror = () => {
+      // 连接断开会自动重连，无需处理
+    }
+
+    return () => es.close()
   }, [])
 
   const handleApprove = async (approvalId: string) => {
     try {
       await fetch(`/api/ai/approve/${encodeURIComponent(approvalId)}`, { method: 'POST' })
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.approvalId === approvalId ? { ...m, role: 'system', content: `已批准: ${m.command}` } : m
-        )
-      )
+      // 状态更新由 SSE 事件流自动处理
       onCommandApprove?.(approvalId)
     } catch {
       /* ignore */
@@ -206,11 +231,7 @@ export function AiChatPanel({ host, onCommandApprove, onCommandReject }: AiChatP
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ reason: '用户拒绝' }),
       })
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.approvalId === approvalId ? { ...m, role: 'system', content: `已拒绝: ${m.command}` } : m
-        )
-      )
+      // 状态更新由 SSE 事件流自动处理
       onCommandReject?.(approvalId)
     } catch {
       /* ignore */
@@ -222,7 +243,7 @@ export function AiChatPanel({ host, onCommandApprove, onCommandReject }: AiChatP
       case 'user':
         return (
           <div key={msg.id} className="flex items-start gap-2 justify-end">
-            <div className="bg-primary text-primary-foreground rounded-lg px-3 py-2 text-sm max-w-[80%]">
+            <div className="bg-primary text-primary-foreground rounded-lg px-3 py-2 text-sm max-w-[80%] break-words">
               {msg.content}
             </div>
             <div className="bg-primary/20 rounded-full p-1 shrink-0">
@@ -237,8 +258,14 @@ export function AiChatPanel({ host, onCommandApprove, onCommandReject }: AiChatP
             <div className="bg-muted rounded-full p-1 shrink-0">
               <Bot className="size-3.5" />
             </div>
-            <div className="bg-muted rounded-lg px-3 py-2 text-sm max-w-[80%] whitespace-pre-wrap">
-              {msg.content || (
+            <div className="bg-muted rounded-lg px-3 py-2 text-sm max-w-[85%]">
+              {msg.content ? (
+                <div className="prose prose-sm dark:prose-invert max-w-none prose-headings:text-foreground prose-p:text-sm prose-p:leading-relaxed prose-code:text-xs prose-code:bg-muted-foreground/10 prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-pre:bg-zinc-950 prose-pre:text-zinc-100 prose-pre:text-xs prose-pre:rounded-lg prose-a:text-primary prose-strong:text-foreground prose-li:text-sm prose-table:text-xs">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                    {msg.content}
+                  </ReactMarkdown>
+                </div>
+              ) : (
                 <span className="inline-flex items-center gap-1 text-muted-foreground">
                   <Loader2 className="size-3 animate-spin" />
                   思考中...
@@ -286,7 +313,7 @@ export function AiChatPanel({ host, onCommandApprove, onCommandReject }: AiChatP
                 <ShieldAlert className="size-3.5" />
                 危险操作需要审批
               </div>
-              <code className="block bg-red-100 dark:bg-red-900/40 rounded px-2 py-1 text-[11px] mb-2 font-mono">
+              <code className="block bg-red-100 dark:bg-red-900/40 rounded px-2 py-1 text-[11px] mb-2 font-mono break-all whitespace-pre-wrap">
                 {msg.command}
               </code>
               <div className="flex items-center gap-1.5">
@@ -321,7 +348,11 @@ export function AiChatPanel({ host, onCommandApprove, onCommandReject }: AiChatP
       case 'system':
         return (
           <div key={msg.id} className="flex justify-center">
-            <span className="text-[11px] text-muted-foreground bg-muted/50 px-2 py-0.5 rounded">
+            <span className={`text-[11px] px-2 py-1 rounded max-w-[92%] break-all ${
+              msg.content.startsWith('错误') || msg.content.startsWith('连接')
+                ? 'bg-red-50 dark:bg-red-950/20 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-400'
+                : 'text-muted-foreground bg-muted/50'
+            }`}>
               {msg.content}
             </span>
           </div>

@@ -9,6 +9,14 @@ import { runAgentStream } from './agent.js'
 const app = express()
 app.use(express.json())
 
+// ---- 请求日志中间件 ----
+app.use((req: Request, _res: Response, next) => {
+  const ts = new Date().toISOString().slice(11, 19)
+  const body = req.method === 'POST' ? JSON.stringify(req.body) : ''
+  console.log(`[AI] ${ts} ${req.method} ${req.path} ${body}`.trim())
+  next()
+})
+
 // SSE 流式聊天端点
 app.post('/chat/stream', async (req: Request, res: Response) => {
   const { host, message, mode } = req.body as {
@@ -22,20 +30,52 @@ app.post('/chat/stream', async (req: Request, res: Response) => {
     return
   }
 
+  console.log(`[AI] 开始处理: host=${host} mode=${mode || 'assistant'} msg="${message.slice(0, 80)}"`)
+
   // 设置 SSE headers
   res.setHeader('Content-Type', 'text/event-stream')
   res.setHeader('Cache-Control', 'no-cache')
   res.setHeader('Connection', 'keep-alive')
   res.setHeader('X-Accel-Buffering', 'no')
 
+  const startTime = Date.now()
   try {
     const stream = runAgentStream(host, message, mode || 'assistant')
 
     for await (const event of stream) {
       const data = JSON.stringify(event)
       res.write(`data: ${data}\n\n`)
+
+      // 打印关键事件
+      switch (event.type as string) {
+        case 'tool_start':
+          console.log(`[AI] 🔧 调用工具: ${(event as { toolName: string }).toolName}`)
+          break
+        case 'tool_end':
+          console.log(`[AI] ✅ 工具完成: ${(event as { toolName: string }).toolName}`)
+          break
+        case 'text':
+          // 太长截断
+          const content = (event as { content: string }).content
+          if (content.length > 200) {
+            console.log(`[AI] 📝 LLM 输出 (${content.length} chars): ${content.slice(0, 200)}...`)
+          } else {
+            console.log(`[AI] 📝 ${content}`)
+          }
+          break
+        case 'done':
+          console.log(`[AI] 🏁 完成，耗时 ${Date.now() - startTime}ms`)
+          break
+        case 'error':
+          console.error(`[AI] ❌ 错误: ${(event as { content: string }).content}`)
+          break
+        case 'approval_required':
+          console.log(`[AI] 🔒 审批: ${(event as unknown as { command: string }).command}`)
+          break
+      }
     }
   } catch (err) {
+    console.error(`[AI] ❌ 异常 (${Date.now() - startTime}ms): ${(err as Error).message}`)
     res.write(`data: ${JSON.stringify({ type: 'error', content: (err as Error).message })}\n\n`)
   } finally {
     res.end()
@@ -55,6 +95,8 @@ app.post('/chat', async (req: Request, res: Response) => {
     return
   }
 
+  console.log(`[AI] 同步处理: host=${host} mode=${mode || 'assistant'}`)
+
   try {
     const stream = runAgentStream(host, message, mode || 'assistant')
     const events: unknown[] = []
@@ -64,7 +106,6 @@ app.post('/chat', async (req: Request, res: Response) => {
       if (event.type === 'done' || event.type === 'error') break
     }
 
-    // 收集所有文本回复
     const texts = events
       .filter((e) => (e as { type: string }).type === 'text')
       .map((e) => (e as { content: string }).content)
@@ -80,6 +121,7 @@ app.post('/chat', async (req: Request, res: Response) => {
       events,
     })
   } catch (err) {
+    console.error(`[AI] 同步处理失败: ${(err as Error).message}`)
     res.status(500).json({ error: (err as Error).message })
   }
 })
@@ -91,6 +133,7 @@ app.get('/health', (_req: Request, res: Response) => {
     status: 'ok',
     provider: config.provider,
     model: config.model,
+    hasApiKey: !!config.apiKey,
   })
 })
 
@@ -102,14 +145,22 @@ if (!config.enabled) {
   process.exit(0)
 }
 
+// 打印配置来源
+console.log('[AI] === 配置加载 ===')
+console.log(`[AI] Provider : ${config.provider}`)
+console.log(`[AI] Base URL : ${config.baseUrl}`)
+console.log(`[AI] Model    : ${config.model}`)
+console.log(`[AI] Port     : ${config.port}`)
+console.log(`[AI] API Key  : ${config.apiKey ? `已配置 (${config.apiKey.slice(0, 7)}...)` : '❌ 未配置'}`)
+console.log(`[AI] Backend  : ${config.backendUrl}`)
+console.log('[AI] ================')
+
 if (!config.apiKey) {
-  console.warn('[AI] ⚠️  未配置 API Key，AI 功能无法使用')
-  console.warn('[AI] 请在 ~/.config/sup/ai.toml 或环境变量 OPENAI_API_KEY 中配置')
+  console.warn('[AI] ⚠️  未配置 API Key，聊天功能将无法使用')
 }
 
 app.listen(config.port, () => {
   console.log(`[AI] AI 服务已启动: http://127.0.0.1:${config.port}`)
-  console.log(`[AI] Provider: ${config.provider}, Model: ${config.model}`)
 })
 
 export default app

@@ -8,9 +8,11 @@ use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query};
 use axum::http::{header, StatusCode, Uri};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use futures::stream::Stream;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -54,8 +56,22 @@ pub fn run(port: u16) -> Result<()> {
 }
 
 async fn serve(port: u16) -> Result<()> {
-    // 尝试启动 AI 服务
-    let _ = crate::aiservice::spawn_if_enabled();
+    // 记录端口号，供后续重启 AI 服务使用
+    crate::aiservice::set_backend_port(port);
+
+    // 在后台尝试启动 AI 服务（不阻塞 Web 启动）
+    let port2 = port;
+    tokio::task::spawn_blocking(move || {
+        let _ = crate::aiservice::spawn_if_enabled(port2);
+    });
+
+    // 后台定期清理超时审批
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let _ = tokio::task::spawn_blocking(|| approval::pending_approvals()).await;
+        }
+    });
 
     let app = Router::new()
         .route("/api/hosts", get(hosts_list).post(hosts_save))
@@ -79,6 +95,7 @@ async fn serve(port: u16) -> Result<()> {
         .route("/api/ai/exec-command", post(ai_exec_command))
         .route("/api/ai/request-approval", post(ai_request_approval))
         .route("/api/ai/approvals", get(ai_list_approvals))
+        .route("/api/ai/approvals-stream", get(ai_approvals_sse))
         .route("/api/ai/approve/:id", post(ai_approve))
         .route("/api/ai/reject/:id", post(ai_reject))
         .route("/api/ai/chat-stream", post(ai_chat_stream))
@@ -873,6 +890,45 @@ async fn ai_request_approval(
     }
 }
 
+/// SSE 审批事件流（替代轮询 /api/ai/approvals）
+async fn ai_approvals_sse() -> Sse<impl Stream<Item = std::result::Result<Event, std::convert::Infallible>>> {
+    use futures::StreamExt;
+    use tokio_stream::wrappers::BroadcastStream;
+
+    // 先发送当前待审批列表
+    let initial = tokio::task::spawn_blocking(approval::pending_approvals)
+        .await
+        .unwrap_or_default();
+
+    let initial_stream = futures::stream::iter(
+        initial.into_iter().map(|req| {
+            Ok(Event::default()
+                .event("new")
+                .data(serde_json::to_string(&req).unwrap_or_default()))
+        }),
+    );
+
+    // 订阅后续事件
+    let rx = approval::subscribe_events();
+    let event_stream = BroadcastStream::new(rx).filter_map(|result| {
+        futures::future::ready(match result {
+            Ok(event) => {
+                let json = serde_json::to_string(&event).unwrap_or_default();
+                let event_type = match &event {
+                    approval::ApprovalEvent::New(_) => "new",
+                    approval::ApprovalEvent::Approved { .. } => "approved",
+                    approval::ApprovalEvent::Rejected { .. } => "rejected",
+                };
+                Some(Ok(Event::default().event(event_type).data(json)))
+            }
+            Err(_) => None, // 跳过 lagged 事件
+        })
+    });
+
+    let stream = initial_stream.chain(event_stream);
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
 async fn ai_list_approvals() -> ApiResult<Json<Vec<approval::ApprovalRequest>>> {
     Ok(Json(approval::pending_approvals()))
 }
@@ -995,6 +1051,12 @@ async fn ai_save_config(Json(req): Json<AiConfigReq>) -> ApiResult<Json<serde_js
         Ok(())
     })
     .await??;
+
+    // 配置变更后重启 AI 服务，使新配置（尤其是 API Key）生效
+    tokio::task::spawn_blocking(|| {
+        crate::aiservice::restart_ai_service();
+    });
+
     Ok(Json(json!({ "ok": true })))
 }
 

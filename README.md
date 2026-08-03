@@ -123,7 +123,7 @@ sup log show <task_id>                               # 单任务文件明细（�
 
 直接运行 `sup`（不带子命令）进入 REPL，风格类似 AI CLI 工具：
 
-```
+```shell
 sup> /use prod          # 连接主机，之后提示符变为 sup(prod)>
 sup(prod)> /push        # 交互式上传向导
 sup(prod)> systemctl restart app    # 非 / 开头的输入直接作为远程命令执行
@@ -190,6 +190,7 @@ port = 7799
 启动 sup 后会自动 spawn AI 服务进程（端口 7799），无需手动管理。AI 服务已内嵌在二进制中，不需要额外的 `ai/` 目录或 `node_modules`。
 
 AI 功能包括：
+
 - **一键巡检**："巡检主机" → 自动收集 CPU / 内存 / 磁盘 / 网络 / 进程指标
 - **智能诊断**：提问主机状态，AI 自动执行命令并分析输出
 - **审批工作流**：`rm -rf`、`shutdown` 等危险命令会弹窗要求人工确认，30s 超时自动拒绝
@@ -223,10 +224,10 @@ release 配置已开启 LTO、strip、`opt-level = "z"`，二进制约 10 MB（�
 
 ## 技术栈
 
-| 层          | 技术                                                                         |
-| ----------- | ---------------------------------------------------------------------------- |
-| CLI / 后端  | Rust（clap / ssh2 / axum / rusqlite / keyring / reqwest）                    |
-| Web 前端    | React + TypeScript（Vite / Tailwind v4 / shadcn/ui / xterm.js / Monaco）     |
-| AI 服务     | Node.js + TypeScript（Express / @langchain/core / @langchain/openai / LangGraph，经 tsup 打包嵌入二进制） |
+| 层         | 技术                                                                                                      |
+| ---------- | --------------------------------------------------------------------------------------------------------- |
+| CLI / 后端 | Rust（clap / ssh2 / axum / rusqlite / keyring / reqwest）                                                 |
+| Web 前端   | React + TypeScript（Vite / Tailwind v4 / shadcn/ui / xterm.js / Monaco）                                  |
+| AI 服务    | Node.js + TypeScript（Express / @langchain/core / @langchain/openai / LangGraph，经 tsup 打包嵌入二进制） |
 
 前端产物经 rust-embed 打进二进制，AI 服务以独立子进程运行。
