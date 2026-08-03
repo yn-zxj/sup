@@ -217,6 +217,8 @@ export function AiChatPanel({ host, onCommandApprove, onCommandReject }: AiChatP
                 break
               case 'tool_start':
                 hasToolsRef.current = true
+                // 新一轮工具调用：重置 post-tool 气泡，使后续文本创建新气泡（紧随新工具之后）
+                postToolAssistantId.current = null
                 {
                   const id = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
                   lastToolMsgId.current = id
